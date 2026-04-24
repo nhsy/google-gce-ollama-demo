@@ -1,0 +1,3 @@
+[allowlist]
+  description = "Ignore gitignored secrets files"
+  paths = ['''terraform\.tfvars''']
