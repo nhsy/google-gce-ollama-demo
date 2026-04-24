@@ -1,0 +1,370 @@
+# https://taskfile.dev
+version: "3"
+
+vars:
+  REGION: us-east4
+  ZONE:
+    sh: terraform output -raw zone 2>/dev/null || echo "us-east4-c"
+  SERVICE_NAME: gce-ollama
+  PROJECT_ID:
+    sh: terraform output -raw project_id 2>/dev/null || gcloud config get-value project 2>/dev/null
+  INSTANCE_NAME:
+    sh: terraform output -raw instance_name 2>/dev/null || echo "gce-ollama"
+  GCS_BUCKET:
+    sh: terraform output -raw gcs_bucket 2>/dev/null || echo ""
+
+tasks:
+
+  default:
+    desc: "List all available tasks"
+    cmds:
+      - task --list
+    silent: true
+
+  # ── Lifecycle ──────────────────────────────────────────────────────────────
+
+  up:
+    desc: "Provision infrastructure, open tunnel, and verify Ollama is ready"
+    cmds:
+      - task: init
+      - task: apply
+      - sleep 10
+      - task: tunnel:stop
+      - task: tunnel:start
+        vars:
+          ZONE: { sh: terraform output -raw zone }
+      - |
+        echo "Waiting for Ollama API..."
+        for i in {1..30}; do
+          if curl -sf http://localhost:11434/api/version > /dev/null 2>&1; then
+            echo "Ollama API ready"
+            break
+          fi
+          sleep 5
+        done
+      - task: verify
+        vars:
+          ZONE: { sh: terraform output -raw zone }
+    silent: true
+
+  stop:
+    desc: "Stop instance — pauses compute billing. RAM disk content is lost."
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        gcloud compute instances stop {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}}
+        echo "Instance stopped. Run 'task start' to resume."
+
+  start:
+    desc: "Start a stopped instance (re-runs startup script, re-pulls model)"
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        gcloud compute instances start {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}}
+        echo "Instance starting. Monitor startup: task logs"
+
+  restart:
+    desc: "Stop then start instance (re-runs startup script, restores model from GCS)"
+    cmds:
+      - task: stop
+      - task: start
+
+  destroy:
+    desc: "Destroy all resources — zero ongoing cost"
+    cmds:
+      - terraform destroy -auto-approve
+      - echo "All resources destroyed."
+
+  delete:
+    desc: "Delete ONLY compute instance + boot disk (preserves GCS cache and network infra)"
+    cmds:
+      - terraform destroy -target=google_compute_instance.ollama -auto-approve
+      - echo "Instance deleted. GCS cache preserved."
+
+  # ── Deps ───────────────────────────────────────────────────────────────────
+
+  deps:
+    desc: "Check required binaries and configuration"
+    silent: true
+    cmds:
+      - |
+        MISSING=0
+
+        check_bin() {
+          if ! command -v "$1" > /dev/null 2>&1; then
+            echo "  MISSING  $1"
+            MISSING=$((MISSING + 1))
+          else
+            echo "  ok       $1"
+          fi
+        }
+
+        echo "=== Binaries ==="
+        check_bin terraform
+        check_bin gcloud
+        check_bin tflint
+        check_bin shellcheck
+        check_bin yamllint
+        check_bin gitleaks
+        check_bin jq
+
+        echo ""
+        echo "=== Environment ==="
+        if [ ! -f terraform.tfvars ]; then
+          echo "  MISSING  terraform.tfvars (copy from terraform.tfvars.example)"
+          MISSING=$((MISSING + 1))
+        else
+          echo "  ok       terraform.tfvars"
+        fi
+
+        echo ""
+        if [ "$MISSING" -gt 0 ]; then
+          echo "${MISSING} issue(s) found."
+          exit 1
+        fi
+        echo "All checks passed."
+
+  # ── Init ───────────────────────────────────────────────────────────────────
+
+  init:
+    desc: "Initialise Terraform"
+    deps: [deps]
+    cmds:
+      - mkdir -p .tmp/
+      - terraform init -upgrade
+
+  # ── Terraform ──────────────────────────────────────────────────────────────
+
+  apply:
+    desc: "terraform apply — provision/update all infrastructure"
+    cmds:
+      - terraform apply -auto-approve
+
+  plan:
+    desc: "Preview Terraform changes"
+    cmds:
+      - terraform plan
+
+  # ── Access ─────────────────────────────────────────────────────────────────
+
+  tunnel:
+    desc: "Open IAP tunnel to Ollama API on localhost:11434 (keep terminal open)"
+    interactive: true
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - ./scripts/tunnel.sh "{{.INSTANCE_NAME}}" "{{.ZONE}}" "{{.PROJECT_ID}}"
+
+  tunnel:start:
+    desc: "Start IAP tunnel in background"
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    preconditions:
+      - test -d .tmp/
+    cmds:
+      - |
+        echo "Starting IAP tunnel in background..."
+        nohup ./scripts/tunnel.sh "{{.INSTANCE_NAME}}" "{{.ZONE}}" "{{.PROJECT_ID}}" \
+          > .tmp/tunnel.log 2>&1 &
+        echo $! > .tmp/tunnel.pid
+        echo "Tunnel started (PID: $!). Log: .tmp/tunnel.log"
+    silent: true
+
+  tunnel:stop:
+    desc: "Kill background IAP tunnel and wait for port 11434 to be released"
+    preconditions:
+      - test -d .tmp/
+    cmds:
+      - |
+        if [ -f .tmp/tunnel.pid ]; then
+          PID=$(cat .tmp/tunnel.pid)
+          kill "$PID" 2>/dev/null || true
+          rm -f .tmp/tunnel.pid
+        fi
+        pkill -f "start-iap-tunnel" 2>/dev/null || true
+        for i in {1..10}; do
+          if ! lsof -ti tcp:11434 > /dev/null 2>&1; then
+            echo "Tunnel stopped."
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "ERROR: port 11434 still bound after 10s." >&2
+        exit 1
+    silent: true
+
+  ssh:
+    desc: "SSH to the instance via IAP"
+    interactive: true
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        gcloud compute ssh {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}} \
+          --tunnel-through-iap
+
+  # ── Models ─────────────────────────────────────────────────────────────────
+
+  models:
+    desc: "List models in Ollama (tunnel must be running)"
+    cmds:
+      - curl -sf http://localhost:11434/api/tags | jq '[.models[] | {name, size}]'
+
+  pull:
+    desc: "Pull an Ollama model via tunnel. Override: MODEL=<model>"
+    vars:
+      MODEL:
+        sh: |
+          if [ -n "{{.MODEL}}" ]; then
+            echo "{{.MODEL}}"
+          else
+            terraform output -raw model_name 2>/dev/null ||
+            grep -E "^ollama_models\s*=" terraform.tfvars | sed 's/.*=\s*\[\s*"\([^"]*\)".*/\1/' ||
+            echo "qwen3-coder-next"
+          fi
+    cmds:
+      - time ollama pull {{.MODEL}}
+      - ollama list
+
+  # ── Cache ──────────────────────────────────────────────────────────────────
+
+  cache:push:
+    desc: "Manually sync RAM disk → GCS cache via SSH"
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        gcloud compute ssh {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}} \
+          --tunnel-through-iap \
+          -- "gcloud storage rsync -r /mnt/ramdisk/ gs://{{.GCS_BUCKET}}/"
+
+  cache:clear:
+    desc: "Delete all objects in the GCS model cache bucket"
+    cmds:
+      - |
+        gcloud storage rm -r "gs://{{.GCS_BUCKET}}/**" || true
+        echo "Cache cleared: gs://{{.GCS_BUCKET}}"
+
+  # ── Verification ───────────────────────────────────────────────────────────
+
+  health:
+    desc: "Health check (tunnel must be running)"
+    silent: true
+    cmds:
+      - |
+        echo "=== /api/version ==="
+        curl -sf http://localhost:11434/api/version | jq .
+        echo ""
+        echo "=== /v1/models ==="
+        curl -sf http://localhost:11434/v1/models | jq .
+        echo ""
+        echo "=== /api/tags ==="
+        curl -sf http://localhost:11434/api/tags | jq '[.models[] | {name, size}]'
+
+  verify:
+    desc: "Test the Ollama endpoint (tunnel must be running)"
+    vars:
+      MODEL:
+        sh: curl -sf http://localhost:11434/api/tags | jq -r '.models[0].name'
+    env:
+      MODEL: "{{.MODEL}}"
+    cmds:
+      - ./scripts/verify.sh
+
+  bench:
+    desc: "Benchmark — speed t/s, tool call reliability. Flags: --all --model=<name> --iterations=<n>"
+    cmds:
+      - ./scripts/benchmark.sh {{.CLI_ARGS}}
+
+  # ── Observability ──────────────────────────────────────────────────────────
+
+  logs:
+    desc: "Stream instance startup and Ollama logs via SSH (Ctrl+C to stop)"
+    interactive: true
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        gcloud compute ssh {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}} \
+          --tunnel-through-iap \
+          -- "tail -f /var/log/ollama-startup.log"
+
+  logs:ollama:
+    desc: "Stream Ollama systemd service logs via SSH"
+    interactive: true
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        gcloud compute ssh {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}} \
+          --tunnel-through-iap \
+          -- "journalctl -u ollama -f"
+
+  logs:cloudinit:
+    desc: "Stream cloud-init output log via SSH"
+    interactive: true
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        gcloud compute ssh {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}} \
+          --tunnel-through-iap \
+          -- "tail -f /var/log/cloud-init-output.log"
+
+  logs:start:
+    desc: "Stream google-startup-scripts service logs via SSH"
+    interactive: true
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        gcloud compute ssh {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}} \
+          --tunnel-through-iap \
+          -- "journalctl -u google-startup-scripts -f"
+
+  status:
+    desc: "Show instance status and model pull progress"
+    vars:
+      ZONE: { sh: terraform output -raw zone }
+    cmds:
+      - |
+        echo "=== Instance status ==="
+        gcloud compute instances describe {{.INSTANCE_NAME}} \
+          --zone {{.ZONE}} \
+          --project {{.PROJECT_ID}} \
+          --format="table(name,status,scheduling.provisioningModel)"
+
+  url:
+    desc: "Print the IAP tunnel command"
+    cmds:
+      - terraform output -raw tunnel_cmd
+
+  # ── Lint ───────────────────────────────────────────────────────────────────
+
+  lint:
+    desc: "Run all linting: shellcheck, terraform validate/fmt/tflint, yamllint, gitleaks"
+    cmds:
+      - shellcheck scripts/*.sh templates/*.sh
+      - terraform validate
+      - terraform fmt -check
+      - tflint
+      - yamllint .
+      - gitleaks detect --no-git

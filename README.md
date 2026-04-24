@@ -2,8 +2,6 @@
 
 Terraform + Taskfile to spin up a single-node [Ollama](https://ollama.com) inference server on a GCP SPOT instance with an NVIDIA RTX PRO 6000 GPU (96 GB GDDR7). Access is via IAP TCP tunnel — no public ingress.
 
-> Companion repo for the blog post: [Running Open-Weight LLMs on Google Cloud: Ephemeral SPOT Instances with 96 GB VRAM for Under £33/Month](https://nhsy.uk/gce-ollama)
-
 ## Stack
 
 | Layer | Technology |
@@ -16,18 +14,6 @@ Terraform + Taskfile to spin up a single-node [Ollama](https://ollama.com) infer
 | IaC | Terraform (google provider `~> 7.28`) |
 | Automation | Taskfile (`task`) |
 | Quality | pre-commit: terraform fmt/validate, shellcheck, yamllint, gitleaks |
-
-## Cost Estimate
-
-| Resource | Type | Monthly Cost (8h/week) |
-|---|---|---|
-| Compute | g4-standard-48 SPOT, 8h/week | ~£23.00 |
-| Boot disk | 100 GB hyperdisk-balanced | ~£6.40 |
-| GCS cache | 100 GB storage | ~£1.60 |
-| External IP | Ephemeral | ~£0.07 |
-| **Total** | | **~£31-33** |
-
-SPOT instances provide ~80% discount vs on-demand (~$4.50/hr). Instance stops (not deletes) on preemption; infrastructure preserved. For accurate real-time pricing, use the [GCP Pricing Calculator](https://cloud.google.com/products/calculator).
 
 ## Prerequisites
 
@@ -63,11 +49,7 @@ task verify    # run a generate test against localhost:11434
 If you need to manually open a foreground tunnel (e.g. after a restart):
 
 ```bash
-# Terminal 1 — keep open:
-task tunnel
-
-# Terminal 2:
-task models
+task tunnel:start
 ```
 
 ## Stop / Resume
@@ -110,10 +92,18 @@ Run `task --list` to see all tasks. Key ones:
 |---|---|
 | `task up` | Provision, tunnel, and verify |
 | `task stop` / `task start` | Pause/resume compute billing |
+| `task restart` | Stop then start instance (restores model from GCS) |
 | `task destroy` | Tear down everything |
+| `task delete` | Delete only compute instance + boot disk (preserves GCS cache and network) |
 | `task tunnel` | Open IAP tunnel (foreground) |
+| `task tunnel:start` / `task tunnel:stop` | Start/kill background IAP tunnel |
+| `task status` | Show instance status and model pull progress |
 | `task models` | List loaded models |
-| `task bench` | Run benchmark (supports `--all`, `--model`, `--iterations`) |
+| `task pull` | Pull an Ollama model (`MODEL=<name>`) |
+| `task verify` | Test the Ollama endpoint |
+| `task bench` | Run benchmark (`--all`, `--model`, `--iterations`) |
+| `task cache:push` | Manually sync RAM disk to GCS cache via SSH |
+| `task cache:clear` | Delete all objects in the GCS model cache bucket |
 | `task logs` | Stream startup logs |
 | `task ssh` | SSH to instance via IAP |
 | `task lint` | Run all linting checks |
