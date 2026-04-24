@@ -1,0 +1,36 @@
+# Secrets and sensitive config
+terraform.tfvars
+terraform.tfvars.json
+
+# Terraform state and provider cache
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Temporary files and plans
+.tmp/
+.plans/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Personal notes
+notes.txt
