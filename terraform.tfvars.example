@@ -1,0 +1,10 @@
+project_id = "your-project-id"
+
+# Optional overrides (defaults shown)
+# region            = "us-east4"
+# zone              = "us-east4-c"
+# service_name      = "gce-ollama"
+# machine_type      = "g4-standard-48"
+# ollama_models     = ["qwen3-coder-next"]
+# ramdisk_size_gb   = 150
+# boot_disk_size_gb = 100
